@@ -14,13 +14,17 @@ torch.manual_seed(1337)
 
 # ---------- Hyperparameters ---------- #
 
-batch_size = 32
-block_size = 8
-max_iters = 3000
-eval_interval = 300
-learning_rate = 1e-2
+batch_size = 64 # how many independent sequences we process in parallel
+block_size = 256 # max context length for predictions
+max_iters = 5000
+eval_interval = 500
+learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
+n_embed = 384
+n_head = 6
+n_layer = 6
+dropout = 0.2
 
 # --------------------------------------- #
 
@@ -44,27 +48,13 @@ encode = lambda s: [string_to_int[c] for c in s] # Create a function to encode a
 int_to_string = {i:ch for i, ch in enumerate(chars)} # Create a dictionary to map integers back to characters
 decode = lambda l: ''.join([int_to_string[i] for i in l]) # Create a function to decode a list of integers into a string
 
-print(encode("hello my name is vamsi"))
-print(decode(encode("hello my name is vamsi")))
-
 data = torch.tensor(encode(text), dtype=torch.long)
 print(data.shape, data.dtype)
-print(data[:100]) # This is how the Transformer will see the data
 
 n = int(0.9 * len(data)) #90% of the data for training, 10% for validation
 
 train_data = data[:n]
 val_data = data[n:]
-
-# Block size is the number of characters that the model will see at a time
-train_data[:block_size+1]
-
-x = train_data[:block_size] # Input is the current character
-y = train_data[1:block_size+1] # Target is the next character
-for t in range(block_size):
-    context = x[:t+1]
-    target = y[t]
-    print(f"when input is {context} the target is {target}")
  
 
 def get_batch(split):
@@ -73,6 +63,7 @@ def get_batch(split):
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([data[i:i+block_size] for i in ix])
     y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+    x, y = x.to(device), y.to(device)
     return x, y
 
 @torch.no_grad()
@@ -89,30 +80,124 @@ def estimate_loss():
     model.train()
     return out
 
-xb, yb = get_batch('train')
-print('inputs:')
-print(xb.shape)
-print(xb)
-print('targets:')
-print(yb.shape)
-print(yb)
-print('--------------------------------')
-
 # Now, lets start feeding this batch of input to feed to the transformer model
 # We will start with the simplest possible neural network which is the bigram language model
 
+class Head(nn.Module):
+    """One head of self-attention."""
+
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embed, head_size, bias=False)
+        self.query = nn.Linear(n_embed, head_size, bias=False)
+        self.value = nn.Linear(n_embed, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)   # (B, T, head_size)
+        q = self.query(x) # (B, T, head_size)
+        # Attention scores ("affinities")
+        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5 # (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
+        v = self.value(x) # (B, T, head_size)
+        out = wei @ v     # (B, T, head_size)
+        return out
+
+
+class MultiHeadAttention(nn.Module):
+    """Multiple heads of self-attention in parallel."""
+
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embed, n_embed)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # Concatenate over the channel dim: (B, T, num_heads * head_size) == (B, T, n_embed)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))  # linear projection back into residual pathway
+        return out
+
+
+class FeedForward(nn.Module):
+    """Position-wise MLP: linear -> ReLU -> linear (computation after communication)."""
+
+    def __init__(self, n_embed):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, 4 * n_embed),
+            nn.ReLU(),
+            nn.Linear(4 * n_embed, n_embed),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class LayerNorm(nn.Module):
+    """Normalize over the last dim (channels) for each token independently.
+
+    Unlike BatchNorm, this does not mix information across the batch, so it is
+    the same at train and eval. gamma and beta are learned scale and shift.
+    """
+
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.beta = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        xmean = x.mean(-1, keepdim=True)
+        xvar = x.var(-1, keepdim=True, unbiased=False)
+        xhat = (x - xmean) / torch.sqrt(xvar + self.eps)
+        return self.gamma * xhat + self.beta
+
+
+class Block(nn.Module):
+    """Transformer block: communication then computation, with pre-norm residuals."""
+
+    def __init__(self, n_embed, n_head):
+        super().__init__()
+        head_size = n_embed // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embed)
+        self.ln1 = LayerNorm(n_embed)
+        self.ln2 = LayerNorm(n_embed)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+
 class BigramLanguageModel(nn.Module):
 
-    def __init__(self, vocab_size):
+    def __init__(self):
         super().__init__()
         # Each token directly reads off the logits for the next token from a lookup table
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
+        self.position_embedding_table = nn.Embedding(block_size, n_embed)
+        self.blocks = nn.Sequential(*[Block(n_embed, n_head) for _ in range(n_layer)])
+        self.ln_f = LayerNorm(n_embed) # final LayerNorm before the classifier
+        self.lm_head = nn.Linear(n_embed, vocab_size)
 
     def forward(self, idx, targets=None):
-
+        B, T = idx.shape
         # idx and targets are both (B,T) where B is the batch size and T is the context length
         # C is the number of channels which i.e. vocabulary size
-        logits = self.token_embedding_table(idx) # (B,T,C)
+        token_emb = self.token_embedding_table(idx) # (B,T,C)
+        position_emb = self.position_embedding_table(torch.arange(T, device=idx.device)) # (T, C)
+        x = token_emb + position_emb # (B,T,C)
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x) # (B,T,vocab_size)
         if targets is None:
             loss = None
         else:
@@ -126,51 +211,43 @@ class BigramLanguageModel(nn.Module):
 
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
+            # crop context to the last block_size tokens (pos embedding only exists for 0..block_size-1)
+            idx_cond = idx[:, -block_size:]
             # get the predictions
-            logits, loss = self(idx)
+            logits, loss = self(idx_cond)
             # focus only on the last time step
             logits = logits[:, -1, :] # (B, C)
             # Apply Softmax to get probabilities
-            probs = F.softmax(logits, dim=1) # (B, C)
+            probs = F.softmax(logits, dim=-1) # (B, C)
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
             # append sampled index to the running sequence
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
-model = BigramLanguageModel(vocab_size)
-logits, loss = model(xb, yb)
-print(logits.shape)
-print(loss)
+model = BigramLanguageModel()
+model = model.to(device)
+print(sum(p.numel() for p in model.parameters()) / 1e6, 'M parameters')
 
-print(decode(model.generate(idx = torch.zeros((1, 1), dtype=torch.long), max_new_tokens=100)[0].tolist()))
-
-# Lets start training the model
-# Create a pytorch optimizer
-
-# Smaller model means we can get away with a larger learning rate
-optimizer = torch.optim.Adam(model.parameters(), learning_rate)
+# Create a pytorch optimizer (AdamW as in the lecture's final script)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 for iter in range(max_iters):
 
-    # Every once in a ehile evaluate the loss on train and val sets
-    if iter % eval_interval == 0:
+    # Every once in a while evaluate the loss on train and val sets
+    if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss()
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
-
-
     # Evaluate the loss
+    xb, yb = get_batch('train')
     logits, loss = model(xb, yb)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
 
-    print(loss.item())
-
-context = torch.zeros((1,1), dtype=torch.long, device=device)
-print(decode(model.generate(idx = torch.zeros((1, 1), dtype=torch.long), max_new_tokens=100)[0].tolist()))
-
+context = torch.zeros((1, 1), dtype=torch.long, device=device)
+print(decode(model.generate(context, max_new_tokens=500)[0].tolist()))
 
 
 
